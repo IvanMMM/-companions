@@ -10,6 +10,7 @@ module.exports = function(io){
         let from = socket.handshake.query.from;
         let to = socket.handshake.query.to;
         let role = socket.handshake.query.role || 'passenger';
+        let maxPassengers = socket.handshake.query.maxPassengers || 4;
 
         //Создаём комнаты метро
         if(!pool[from])     pool[from] = {};
@@ -19,7 +20,7 @@ module.exports = function(io){
         if(role!='driver'){
             pool[from][to].push(socket.id);
         }else{
-            let room = new Room(from,to);
+            let room = new Room(from,to,maxPassengers);
             room.setDriver(socket.id);
         }
 
@@ -32,10 +33,10 @@ module.exports = function(io){
             rooms[socket.room].removeUser(socket.id);
         });
 
-        socket.on('message',data=>{
+        socket.on('message',text=>{
             if(!socket.room) socket.emit('error','Incorrect room to send message to');
-            console.log(`message: ${JSON.stringify(data)}`);
-            socket.to(socket.room).emit('message', {id:socket.id,text:data.text});
+            console.log(`message: ${JSON.stringify(text)}`);
+            socket.to(socket.room).emit('message', {id:socket.id,room:rooms[socket.room],text:text});
         });
     });
 
