@@ -9,37 +9,27 @@ module.exports = function(io){
         console.log(`User ${socket.id} connected. Total users: ${Object.keys(io.sockets.sockets).length}`);
         let from = socket.handshake.query.from;
         let to = socket.handshake.query.to;
+        let role = socket.handshake.query.role || 'passenger';
 
         //Создаём комнаты метро
-        if(!pool[from])
-            pool[from] = {};
-        if(!pool[from][to])
-            pool[from][to] = {passengers:[],rooms:{}};
+        if(!pool[from])     pool[from] = {};
+        if(!pool[from][to]) pool[from][to] = [];
 
-        //Добавляем сокет в общий пул сокетов по метро
-        pool[from][to].passengers.push(socket.id);
-
-        //Если желающих на поездку >= 3х - создаём новую комнату для попутчиков.
-        checkRoomReady(from,to);
+        //Добавляем пассажира в ожидающие
+        if(role!='driver'){
+            pool[from][to].push(socket.id);
+        }else{
+            let room = new Room(from,to);
+            room.setDriver(socket.id);
+        }
 
         socket.on('disconnect', ()=>{
             //Удаляем его из списка пассажиров, если он ещё там
-            let indexPass = pool[from][to].passengers.indexOf(socket.id);
-            if(indexPass > -1) pool[from][to].passengers.splice(indexPass, 1);
+            let indexPass = pool[from][to].indexOf(socket.id);
+            if(indexPass > -1) pool[from][to].splice(indexPass, 1);
 
             //Удаляем его из списка комнаты, есть такая есть
-            if(pool[from][to].rooms[socket.room]){
-                console.log(`Sended 'leave' message from ${socket.id} to room ${socket.room}`);
-                io.in(socket.room).emit('leave', {id:socket.id});
-
-                let indexRoom = pool[from][to].rooms[socket.room].indexOf(socket.id);
-                if(indexRoom > -1){
-                    pool[from][to].rooms[socket.room].splice(indexRoom, 1);
-                    //Удаляем пустую комнату
-                    if(pool[from][to].rooms[socket.room].length==0) delete pool[from][to].rooms[socket.room]
-                }
-
-            }
+            rooms[socket.room].removeUser(socket.id);
         });
 
         socket.on('message',data=>{
@@ -49,26 +39,105 @@ module.exports = function(io){
         });
     });
 
-    function checkRoomReady(from,to){
-        if(pool[from][to].passengers.length<3) return;
-        let room = makeId(32);
+    //Цикл поиска попутчиков
+    /*
+        1. Водитель создаёт новую комнату. Мы ищем ему столько попутчиков сколько он хочет, добавляя их по одному.
+        2. 4ре попутчика создают новую комнату для поездки на такси.
+        3. Закидываем всех в чат.
+    */
 
-        for(let i=0;i<3;i++){
-            let socketId = pool[from][to].passengers.shift();
-            console.log(`Adding ${socketId} to #${room}`);
+    let rooms = {};
+    class Room {
+        constructor(from, to, maxPassengers){
+            this.id = makeId(16);
+            this.from = from;
+            this.to = to;
+            this.maxPassengers = maxPassengers || 4;
+            this.passengers = [];
+            this.driver = false;
+            rooms[this.id] = this;
+            console.log(`New room created: ${JSON.stringify(this)}`)
+        }
 
-            pool[from][to].rooms[room] = [];
-            pool[from][to].rooms[room].push(socketId);
+        addPassenger(passengerId){
+            if(this.passengers.length>=this.maxPassengers) return new Error('Too many passengers');
 
-            let socket = io.sockets.connected[socketId];
-            socket.room = room;
-            socket.join(room, ()=>{
-                console.log(`Sended 'join' message from ${socket.id} to room ${room}`);
-                //socket.broadcast.to(room).emit('join', {id:socket.id,room:room,from:from,to:to});
-                io.in(room).emit('join', {id:socket.id,room:room,from:from,to:to});
+            //Удаляем пассажира из списка ожидающих
+            let index = pool[this.from][this.to].indexOf(passengerId);
+            pool[this.from][this.to].splice(index, 1);
+
+            //Добавляем пассажира в комнату
+            let socket = io.sockets.connected[passengerId];
+            console.log(`Adding ${socket.id} to room ${this.id}`);
+            socket.join(this.id, ()=>{
+                socket.room = this.id;
+                this.passengers.push(passengerId);
+                console.log(`Sended 'join' message from ${socket.id} to room ${this.id}`);
+                io.in(this.id).emit('join', {id:socket.id,room:this,role:'passenger'});
+                socket.emit('joined',{room:this,role:'passenger'})
             });
         }
+
+        removeUser(userId){
+            let index = this.passengers.indexOf(userId);
+            if(index<0 && this.driver!=userId) return new Error('User not found');
+            console.log(`Sended 'leave' message from ${userId} to room ${this.id}`);
+            if(index>=0){
+                this.passengers.splice(index, 1);
+                io.in(this.id).emit('leave', {id:userId,room:this,role:'passenger'});
+            }else{
+                this.driver=false;
+                io.in(this.id).emit('leave', {id:userId,room:this,role:'driver'});
+            }
+            if(!this.passengers.length && !this.driver) delete rooms[this.id];
+        }
+
+        setDriver(driverId){
+            if(this.driver && driverId) return new Error('This room already has a driver');
+            let socket = io.sockets.connected[driverId];
+            socket.room = this.id;
+            this.driver = driverId;
+        }
+
+        static getFreeRooms(from,to){
+            let result = [];
+            Object.keys(rooms).forEach(room=>{
+                if(rooms[room].driver && rooms[room].passengers.length<rooms[room].maxPassengers){
+                    if(from && to){
+                        if(rooms[room].from==from && rooms[room].to==to)
+                            result.push(rooms[room]);
+                    }
+                    result.push(rooms[room]);
+                }
+            });
+            return result;
+        }
     }
+
+    setInterval(function(){
+        let freeRooms = Room.getFreeRooms();
+        freeRooms.forEach(room=>{
+            //Распихиваем пользователей по комнатам с водителями и местами
+            pool[room.from][room.to].forEach(passengerId=>{
+                if(room.passengers.length<room.maxPassengers) room.addPassenger(passengerId)
+            })
+        });
+
+        //Если свободных комнат с водителями нет, но есть большое количество пассажиров
+        Object.keys(pool).forEach(from=>{
+            Object.keys(pool[from]).forEach(to=>{
+                if(pool[from][to].length>=4){
+                    let room = new Room(from,to,4);
+
+                    //Ищем 4х пассажиров
+                    for(let i=0;i<4;i++){
+                        let socketId = pool[from][to].shift();
+                        if(room.passengers.length<room.maxPassengers) room.addPassenger(socketId);
+                    }
+                }
+            })
+        })
+    },5*1000);
 };
 
 
